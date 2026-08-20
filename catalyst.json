@@ -1,9 +1,13 @@
 {
   "functions": {
     "targets": [
+      "extensionLifecycle",
       "fileUpload",
       "liveChatSender",
-      "liveChatWebhook"
+      "liveChatWebhook",
+      "mediaDiagnostic",
+      "orgConfigApi",
+      "whatsappProxy"
     ],
     "ignore": [],
     "source": "functions"

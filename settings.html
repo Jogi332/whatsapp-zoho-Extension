@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Whatsyoo Settings</title>
+<link rel="stylesheet" href="style.css?v=20260813b">
+<link rel="stylesheet" href="settings.css?v=2">
+<script src="https://live.zwidgets.com/js-sdk/1.2/ZohoEmbededAppSDK.min.js"></script>
+</head>
+<body>
+  <div id="settingsRoot">
+    <h1>Whatsyoo Settings</h1>
+    <p class="settingsIntro">
+      Engati, WorkDrive, and other credentials are configured as CRM Variables
+      (Setup &rarr; Developer Hub &rarr; Variables) - confirmed as Zoho's
+      recommended pattern for per-org third-party API keys. See SETUP.md for
+      the full list of variable names and where to find each value. This page
+      only shows the one thing that can't be a CRM Variable you set yourself:
+      your org's generated Engati webhook URL.
+    </p>
+
+    <div id="settingsStatus" class="settingsStatus"></div>
+
+    <section class="settingsSection">
+      <h2>Your webhook URL</h2>
+      <p>Paste this into Engati &rarr; Configure &rarr; External Live Chat &rarr; External Webhook URL.</p>
+      <div class="settingsRow">
+        <input id="webhookUrlField" type="text" readonly value="Loading..." />
+        <button id="copyWebhookBtn" type="button">Copy</button>
+      </div>
+    </section>
+
+    <section class="settingsSection">
+      <h2>Lead sync (optional)</h2>
+      <p>
+        For inbound WhatsApp messages to auto-create/update CRM Leads, find
+        your installed extension's Lead-sync function in Setup &rarr;
+        Developer Hub &rarr; Functions, copy its REST API URL, and paste it
+        below. Without this, messaging still works, but Leads won't be
+        created automatically.
+      </p>
+      <label>Lead-sync Function URL
+        <input id="f_crm_function_url" type="password" placeholder="(unchanged - enter to replace)" />
+      </label>
+      <button id="saveFunctionUrlBtn" type="button">Save</button>
+    </section>
+  </div>
+  <script src="sharedConfig.js?v=1"></script>
+  <script src="settings.js?v=2"></script>
+</body>
+</html>

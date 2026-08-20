@@ -1,5 +1,29 @@
 # Per-Customer Setup Runbook
 
+> **This is the LEGACY, per-customer-dedicated-project runbook.** A
+> Marketplace-extension migration is in progress (see
+> `~/.claude/plans/starry-swimming-wombat.md`) that moves new installs onto
+> one shared, multi-tenant Catalyst backend with a self-service Settings
+> page (`settings.html`) instead of the manual phases below. This document
+> still describes exactly how EXISTING customers' dedicated-project
+> deployments work and continue to be maintained (no forced cutover - see
+> the plan's Phase F) - don't delete or "clean up" any of it until those
+> customers are actually migrated. It will be rewritten once the self-service
+> flow fully replaces it.
+>
+> **New/shared-backend installs (confirmed by Zoho Marketplace support -
+> Sigma doesn't support Connections for CRM extensions, CRM Variables is the
+> recommended pattern) need these additional CRM Variables that the legacy
+> flow never used** (WorkDrive credentials used to be Catalyst console env
+> vars per customer project - now they're CRM Variables like everything
+> else, read by the widget and passed through per-request):
+> `WORKDRIVE_CLIENT_ID`, `WORKDRIVE_CLIENT_SECRET`, `WORKDRIVE_REFRESH_TOKEN`,
+> `WORKDRIVE_FOLDER_ID` (required for attachments), and optionally
+> `WORKDRIVE_ACCOUNTS_HOST` / `WORKDRIVE_API_HOST` / `WORKDRIVE_HOST` /
+> `WORKDRIVE_DOWNLOAD_HOST` for non-`.in` data centres - same values/lookup
+> steps as Phase 4c below, just set as a CRM Variable instead of a Catalyst
+> function environment variable.
+
 How to install the Whatsyoo WhatsApp widget for a new customer.
 
 **Architecture (decided Aug 9, 2026):**
@@ -527,6 +551,26 @@ binding constraint.
   (most likely: the unusually long/complex `?x-cli-msg=...` query string itself, or WorkDrive's
   CDN applying anti-hotlink/bot rules against non-browser fetchers). The paste-a-URL field is
   unaffected and still works standalone — this only blocks the new upload-from-device path.
+
+  **UPDATE (Phase E investigation, this migration - see `~/.claude/plans/starry-swimming-wombat.md`):**
+  a genuinely new, concrete, previously-undiagnosed bug was found by code review (not yet
+  confirmed by a real send): `functions/fileUpload/index.js`'s dispatcher only ever routed a
+  `GET` request to the `/media?id=<shortId>` proxy path; a `HEAD` request to the exact same URL
+  fell through to the upload handler instead, which returned a `200`-wrapped
+  `{statusCode:400, "filename and dataBase64 required"}` JSON error rather than real media
+  headers. Many media-fetching clients issue a preliminary `HEAD` probe (checking
+  `Content-Length`/`Content-Type` against platform size/type limits) before the real `GET` — if
+  WhatsApp's business media fetcher does this, it would receive that nonsense JSON instead of
+  valid headers and could reject the attachment silently and asynchronously, exactly matching the
+  reported symptom (Engati's API accepts the send with a real `messageId`, but the media never
+  arrives). **Fixed** in `fileUpload/index.js` (HEAD now routes to the same `streamMedia` path as
+  GET, returning identical headers with no body) — **but this is "a" fix, not confirmed as "the"
+  fix yet.** A temporary diagnostic function, `functions/mediaDiagnostic/`, was also added
+  (logs every header/method a real test send's media fetch uses, serves a real tiny valid JPEG so
+  delivery can genuinely succeed if this really was the cause) — deploy it, send a real
+  AGENT_MESSAGE with `media.value` pointed at its URL, and check Catalyst's logs before trusting
+  either the diagnosis or the fix. Delete `mediaDiagnostic` once the investigation concludes; it's
+  scaffolding, not a shipped feature.
 
   **The underlying mechanism was verified end-to-end via curl (real upload, real link, real
   unauthenticated fetch) before writing any function code — not guessed:**

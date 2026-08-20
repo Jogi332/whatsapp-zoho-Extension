@@ -1,0 +1,175 @@
+// leadSync.dg — DRAFT, not deployed, not tested.
+//
+// This is Deluge, not JavaScript - it must be pasted into and authored
+// inside Zoho's Sigma console (Developer Console -> Automate -> Functions
+// -> New Function -> "Invoke as REST API": Yes), it cannot be deployed from
+// this repo/Catalyst CLI the way the functions/ folder is. Treat this file
+// as a starting reference to paste in and adapt, not working source.
+//
+// PURPOSE (see plan Phase D correction, confirmed by Zoho Marketplace
+// support Aug 2026 - "Zoho CRM Extension Development - US DC Requirement &
+// Connections Support Query" email thread): replaces functions/liveChatWebhook
+// /crmLeads.js's OAuth-based Lead/Task/Signal write for the shared-backend
+// extension path. As a REST-API-triggered Function, Zoho generates a unique
+// URL + zapikey PER INSTALLING ORG at setup time, and this function runs
+// with implicit, tokenless access to that org's own CRM data - no Self
+// Client, no refresh token, no per-customer OAuth setup.
+//
+// CALL DIRECTION (settled - see plan's "Correction" section, revised once
+// more after drafting the first version of this file): Engati's webhook
+// still points at Catalyst's liveChatWebhook, UNCHANGED - the whole
+// webhook_slug-based org-resolution mechanism (plan Phase A) stays exactly
+// as built and tested, no new CRM Variable needed for it. It is CATALYST
+// that calls THIS function, not the other way around: liveChatWebhook
+// (for shared-backend/extension traffic only - legacy dedicated-project
+// deployments still use crmLeads.js's OAuth path unchanged) makes one
+// plain HTTPS POST here after storing the raw event, passing just
+// {userId, displayName}. This function does the Lead/Task/Signal write and
+// returns; it does NOT need to know anything about Engati's packet shape,
+// Catalyst's Data Store, or any CRM Variable - clean separation, smallest
+// possible surface for this Deluge code to get wrong.
+//
+// (Earlier draft of this file had Engati calling this Function directly and
+// this function invokeurl-ing BACK to Catalyst via a CATALYST_WEBHOOK_SLUG
+// CRM Variable the admin would paste in. Reversed: it required the admin to
+// route two different URLs correctly, and needed an unconfirmed Deluge CRM-
+// Variable-read API. This direction reuses only already-proven pieces.)
+//
+// SETUP (per the linked Zoho help article - see plan/email thread):
+//   1. Developer Console -> Automate -> Functions -> New Function.
+//   2. Set "Invoke as REST API" to Yes.
+//   3. Paste/adapt this logic (Deluge syntax, not JS - see conversion notes
+//      inline below for every call that came from crmLeads.js).
+//   4. Save - Zoho shows a production URL + zapikey for the CURRENT org.
+//      The org's admin needs to find this (Setup -> Developer Hub ->
+//      Functions, or wherever Zoho surfaces an installed extension
+//      function's REST API details to an org admin - CONFIRM the exact
+//      location, not verified here) and paste the full URL into the
+//      Settings page's "Lead sync function URL" field (settings.html/
+//      settings.js, functions/orgConfigApi - stored as
+//      OrgConfig.crm_function_url, treated as a secret: write-only, never
+//      echoed back by GET, same principle as the credential fields removed
+//      from OrgConfig everywhere else in this migration).
+//   5. Engati's own webhook URL is UNCHANGED - still the Catalyst
+//      liveChatWebhook URL from the Settings page's first section, exactly
+//      as built in plan Phase A/D. Nothing about the admin's Engati
+//      Configure-screen setup changes because of this function existing.
+//
+// WHAT'S DIFFERENT FROM crmLeads.js's LOGIC, deliberately simplified for a
+// first draft (Deluge has no npm-equivalent module system, and rewriting
+// crmLeads.js's full sophistication - two-layer cache, in-process Map,
+// backfill-if-needed name repair, etc. - in Deluge is a separate, larger
+// task than this draft attempts):
+//   - No in-process/Catalyst-cache layer for "recently created" phone
+//     numbers (crmLeads.js's rememberLocally/recallFromCache) - Deluge
+//     functions are stateless per-invocation, there is no long-lived
+//     process to cache in. Relies on upsertRecords' duplicate_check_fields
+//     only. May reintroduce the same "two quick messages create two Leads"
+//     race crmLeads.js's comments describe fixing - worth real testing
+//     before trusting this in production, same rigor as everything else in
+//     this repo.
+//   - No separate updateLeadName/backfillIfNeeded name-repair pass - folds
+//     into a single upsert. Revisit if placeholder names ("WhatsApp
+//     <number>") are seen persisting after a real name becomes known via a
+//     later call with a real displayName.
+//
+// INPUT: a plain JSON object Catalyst constructs itself - {userId, displayName}
+// (displayName optional/blank). NOT Engati's raw packet shape - Catalyst
+// already parsed that in liveChatWebhook/index.js before calling here.
+// CONFIRM the exact variable-binding behavior Sigma gives a REST API
+// function for its POST body (this draft assumes a `request` map is
+// available, per the fetched help article's code snippets - not verified
+// against a real Sigma environment).
+
+devNote = "DRAFT - not tested against a real Sigma environment, adapt field access to what Sigma actually provides for a REST API function's request body";
+
+userId = ifnull(request.get("userId"), "");
+displayName = ifnull(request.get("displayName"), "");
+
+digits = userId.replaceAll("[^0-9]", "");
+
+// Web-channel sessions use UUIDs, not phone numbers - skip rather than
+// creating junk records. Mirrors crmLeads.js's ensureLeadForPhone guard.
+if(digits.length() >= 8 && digits == userId.trim())
+{
+	phone = "+" + digits;
+	fallbackName = "WhatsApp " + digits;
+	leadName = displayName != "" ? displayName : fallbackName;
+
+	// Zoho CRM's REST-equivalent "datetime" rejects a plain ISO "Z" suffix -
+	// crmLeads.js's zohoDateTime() comment documents the exact failure this
+	// caused (INVALID_DATA). Deluge's zoho.currenttime (org timezone) should
+	// be safe to use directly, but CONFIRM this against a real Lead write
+	// before trusting it - don't assume Deluge's datetime handling matches
+	// raw REST's quirks just because it's a different code path.
+	nowStamp = zoho.currenttime;
+
+	leadMap = Map();
+	leadMap.put("Last_Name", leadName);
+	leadMap.put("Phone", phone);
+	leadMap.put("Lead_Source", "WhatsApp");
+	leadMap.put("WhatsApp_Unread", true);
+	leadMap.put("Last_WhatsApp_Message", nowStamp);
+
+	// upsertRecords with duplicate_check_fields does the find-or-create
+	// atomically against live data - same reasoning as crmLeads.js's
+	// upsertLead() comment re: the CRM /search index lagging writes by
+	// several seconds. CONFIRM Deluge's upsertRecords exposes
+	// duplicate_check_fields the same way the REST /upsert endpoint does -
+	// this is the single most important call in this draft to verify
+	// before trusting it.
+	upsertResp = zoho.crm.upsertRecords("Leads", leadMap, {"duplicate_check_fields": {"Phone"}});
+	leadId = null;
+	if(upsertResp != null && upsertResp.get("id") != null)
+	{
+		leadId = upsertResp.get("id");
+	}
+
+	if(leadId != null)
+	{
+		// Reply Task - mirrors createReplyTask() in crmLeads.js. Owner
+		// resolution simplified to the Lead's own Owner (Deluge's implicit
+		// CRM access means we can just read it back) rather than
+		// crmLeads.js's FALLBACK_TASK_OWNER_ID constant, which was specific
+		// to one legacy customer's org and should NOT be reused here - see
+		// that file's updated header note.
+		leadRecord = zoho.crm.getRecordById("Leads", leadId);
+		ownerId = leadRecord != null ? leadRecord.get("Owner").get("id") : null;
+
+		taskMap = Map();
+		taskMap.put("Subject", "Reply to WhatsApp message - " + leadName);
+		taskMap.put("Status", "Not Started");
+		taskMap.put("Priority", "High");
+		taskMap.put("Due_Date", zoho.currentdate);
+		taskMap.put("What_Id", leadId);
+		taskMap.put("$se_module", "Leads");
+		if(ownerId != null)
+		{
+			taskMap.put("Owner", ownerId);
+		}
+		createTaskResp = zoho.crm.createRecord("Tasks", taskMap);
+
+		// Signal notification - mirrors notifySignal() in crmLeads.js.
+		// CONFIRM the signal_namespace: crmLeads.js's was specific to one
+		// legacy customer's org-created Signal
+		// ("whatsyoo_newwhatsappmessage") - every installing org needs
+		// their OWN Signal created by hand (Setup > Experience Center >
+		// Signals, Trigger via API) before this call can succeed, same as
+		// the legacy setup required. Consider whether this step belongs in
+		// the Settings page's instructions once this file is finalized,
+		// since it's a real per-org manual step that doesn't go away with
+		// this migration. Left as a TODO below - needs the exact Deluge
+		// invokeUrl shape confirmed against a real org with a Signal
+		// already configured.
+	}
+
+	response = Map();
+	response.put("ok", true);
+	response.put("leadId", leadId);
+	return response;
+}
+
+response = Map();
+response.put("ok", true);
+response.put("skipped", "userId is not a plain phone number");
+return response;

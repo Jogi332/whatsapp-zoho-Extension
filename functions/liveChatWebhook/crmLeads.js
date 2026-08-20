@@ -13,17 +13,41 @@
 // match. That also makes it self-healing - if a create fails, the contact's
 // next message retries it.
 //
-// CREDENTIALS: read from environment variables, set per deployment in the
-// Catalyst console (Functions > liveChatWebhook > Configuration). They are
-// deliberately NOT committed - each customer's Catalyst project holds their
-// own org's values. See SETUP.md.
-//   ZOHO_CLIENT_ID
-//   ZOHO_CLIENT_SECRET
-//   ZOHO_REFRESH_TOKEN
-//   ZOHO_ACCOUNTS_HOST   optional, default accounts.zoho.in
-//   ZOHO_API_HOST        optional, default www.zohoapis.in
-// The hosts matter: a customer on the US/EU data centre uses .com / .eu, and
-// calling the wrong one fails authentication in a confusing way.
+// *** LEGACY-PATH-ONLY as of the Deluge correction below - see index.js's
+// comment at its ensureLeadForPhone() call site for the full story. Kept
+// working exactly as-is for existing per-customer dedicated-project
+// deployments; NOT used by new, shared-backend/extension installs anymore. ***
+//
+// CORRECTED ARCHITECTURE (confirmed by Zoho Marketplace support, Aug 2026 -
+// see "Zoho CRM Extension Development - US DC Requirement & Connections
+// Support Query" email thread): Sigma/CRM extensions don't support
+// "Connections" for third-party auth, and per-org Self Client OAuth (what
+// this whole file does) is exactly the manual-per-customer burden the
+// Marketplace migration set out to remove. Zoho's confirmed alternative for
+// unattended, per-org CRM writes is a REST-API-triggered Deluge Function
+// bundled in the extension, which gets implicit, tokenless CRM access - see
+// deluge/leadSync.dg (new, in this repo). New/shared-backend installs do
+// their Lead/Task/Signal writes there instead of through this file.
+//
+// CREDENTIALS (legacy path only): every function here takes an `orgConfig`
+// argument (the resolved OrgConfig row from orgConfig.js, or null - always
+// null on this path, since legacy deployments have no OrgConfig table at
+// all). Credentials fall back to process.env exactly as before this
+// migration - this keeps every existing customer's deployment working
+// unmodified.
+//
+//   ZOHO_CLIENT_ID / ZOHO_CLIENT_SECRET / ZOHO_REFRESH_TOKEN
+//   ZOHO_ACCOUNTS_HOST (default accounts.zoho.in) / ZOHO_API_HOST (default www.zohoapis.in)
+//
+// The orgConfig.zoho_* fields this file's functions also accept are now
+// dead weight for the shared-backend path (nothing populates them anymore -
+// see the Deluge redirect above) but harmless to leave wired, in case a
+// future case turns up where an external-backend CRM write is still needed
+// per org despite Deluge covering the Engati case.
+//
+// The hosts matter regardless of which path is used: a customer on the US/EU
+// data centre uses .com / .eu, and calling the wrong one fails authentication
+// in a confusing way.
 
 const https = require('https');
 
@@ -46,25 +70,33 @@ function requestJson(options, body) {
   });
 }
 
-// Access tokens last an hour. Cache across warm invocations so we're not
-// burning a token refresh on every single inbound message.
-let cachedToken = null;
-let cachedTokenExpiresAt = 0;
+// Access tokens last an hour. Cached PER TENANT (keyed by client id, which is
+// unique per org whether it came from OrgConfig or process.env) across warm
+// invocations, so we're not burning a token refresh on every single inbound
+// message. A single shared module-level token (the pre-migration design)
+// would leak org A's CRM access token into org B's request on this shared
+// backend - this map is what keeps tenants isolated.
+const tokenCache = new Map(); // clientId -> { token, expiresAt }
 
-function accountsHost() { return process.env.ZOHO_ACCOUNTS_HOST || 'accounts.zoho.in'; }
-function apiHost() { return process.env.ZOHO_API_HOST || 'www.zohoapis.in'; }
+function accountsHost(orgConfig) {
+  return (orgConfig && orgConfig.zoho_accounts_host) || process.env.ZOHO_ACCOUNTS_HOST || 'accounts.zoho.in';
+}
+function apiHost(orgConfig) {
+  return (orgConfig && orgConfig.zoho_api_host) || process.env.ZOHO_API_HOST || 'www.zohoapis.in';
+}
 
-async function getAccessToken() {
-  const now = Date.now();
-  // Refresh a minute early rather than racing the expiry.
-  if (cachedToken && now < cachedTokenExpiresAt - 60000) { return cachedToken; }
-
-  const clientId = process.env.ZOHO_CLIENT_ID;
-  const clientSecret = process.env.ZOHO_CLIENT_SECRET;
-  const refreshToken = process.env.ZOHO_REFRESH_TOKEN;
+async function getAccessToken(orgConfig) {
+  const clientId = (orgConfig && orgConfig.zoho_client_id) || process.env.ZOHO_CLIENT_ID;
+  const clientSecret = (orgConfig && orgConfig.zoho_client_secret) || process.env.ZOHO_CLIENT_SECRET;
+  const refreshToken = (orgConfig && orgConfig.zoho_refresh_token) || process.env.ZOHO_REFRESH_TOKEN;
   if (!clientId || !clientSecret || !refreshToken) {
-    throw new Error('Zoho CRM credentials not configured (ZOHO_CLIENT_ID / ZOHO_CLIENT_SECRET / ZOHO_REFRESH_TOKEN)');
+    throw new Error('Zoho CRM credentials not configured for this tenant (client id / secret / refresh token)');
   }
+
+  const now = Date.now();
+  const cached = tokenCache.get(clientId);
+  // Refresh a minute early rather than racing the expiry.
+  if (cached && now < cached.expiresAt - 60000) { return cached.token; }
 
   const form = 'grant_type=refresh_token'
     + '&client_id=' + encodeURIComponent(clientId)
@@ -72,7 +104,7 @@ async function getAccessToken() {
     + '&refresh_token=' + encodeURIComponent(refreshToken);
 
   const res = await requestJson({
-    hostname: accountsHost(),
+    hostname: accountsHost(orgConfig),
     path: '/oauth/v2/token',
     method: 'POST',
     headers: {
@@ -86,8 +118,7 @@ async function getAccessToken() {
     throw new Error('Token refresh failed (' + res.statusCode + '): ' + String(res.body).slice(0, 300));
   }
   const expiresInSec = (res.json && res.json.expires_in) || 3600;
-  cachedToken = token;
-  cachedTokenExpiresAt = Date.now() + expiresInSec * 1000;
+  tokenCache.set(clientId, { token: token, expiresAt: Date.now() + expiresInSec * 1000 });
   return token;
 }
 
@@ -113,10 +144,10 @@ function phoneVariants(digits) {
   return ['+' + digits, digits];
 }
 
-async function findLeadByPhone(token, digits) {
+async function findLeadByPhone(orgConfig, token, digits) {
   for (const variant of phoneVariants(digits)) {
     const res = await requestJson({
-      hostname: apiHost(),
+      hostname: apiHost(orgConfig),
       path: '/crm/v2/Leads/search?phone=' + encodeURIComponent(variant),
       method: 'GET',
       headers: { 'Authorization': 'Zoho-oauthtoken ' + token }
@@ -139,10 +170,10 @@ function fallbackName(digits) { return 'WhatsApp ' + digits; }
 // carries a name) once a later START_CHAT supplies one. Best-effort - a
 // failure here shouldn't take down the caller, the Lead already exists and
 // works fine, it would just keep its placeholder name.
-async function updateLeadName(token, id, displayName) {
+async function updateLeadName(orgConfig, token, id, displayName) {
   const payload = JSON.stringify({ data: [{ id: id, Last_Name: displayName }] });
   const res = await requestJson({
-    hostname: apiHost(),
+    hostname: apiHost(orgConfig),
     path: '/crm/v2/Leads',
     method: 'PUT',
     headers: {
@@ -178,10 +209,15 @@ function zohoDate(date) {
 
 // Used only if a Lead's Owner is ever unexpectedly blank when creating the
 // reply Task below. Owner is a mandatory Zoho CRM field, so this is
-// defensive insurance rather than an expected path. Whatsyoo Support user,
-// this org - see whatsapp-unread-notification-system memory for how to look
-// up the right id if this ever needs to change.
-const FALLBACK_TASK_OWNER_ID = '1371289000000545001';
+// defensive insurance rather than an expected path.
+//
+// NOTE (multi-tenancy): this id is specific to ONE customer's org - it must
+// not be relied on for any other tenant. On the shared backend this should
+// really come from orgConfig (e.g. orgConfig.fallback_task_owner_id) rather
+// than being a shared constant; kept as a legacy-path-only fallback until
+// that column exists. See whatsapp-unread-notification-system memory for how
+// to look up the right id for a given org.
+const LEGACY_FALLBACK_TASK_OWNER_ID = '1371289000000545001';
 
 // Creates the "reply to this WhatsApp message" Task directly via the CRM
 // REST API, called synchronously right after markUnread below.
@@ -195,13 +231,9 @@ const FALLBACK_TASK_OWNER_ID = '1371289000000545001';
 // exact same create-Task-for-current-Owner logic here instead, in the same
 // Catalyst invocation that already updates the Lead, removes that queue
 // entirely - the only latency left is the two direct HTTPS calls below.
-//
-// The Workflow Rule + Function are left in place in the CRM (disabled) as a
-// reference/fallback rather than deleted - see the memory note for the
-// exact Deluge source if this ever needs restoring.
-async function createReplyTask(token, leadId) {
+async function createReplyTask(orgConfig, token, leadId) {
   const res = await requestJson({
-    hostname: apiHost(),
+    hostname: apiHost(orgConfig),
     path: '/crm/v2/Leads/' + leadId + '?fields=First_Name,Last_Name,Owner',
     method: 'GET',
     headers: { 'Authorization': 'Zoho-oauthtoken ' + token }
@@ -212,7 +244,8 @@ async function createReplyTask(token, leadId) {
   // entirely in Last_Name via updateLeadName's backfill) - use both when
   // available, same as how Zoho's own "Lead Name" display combines them.
   const leadName = ((record && ((record.First_Name ? record.First_Name + ' ' : '') + (record.Last_Name || ''))) || '').trim() || 'WhatsApp Lead';
-  const ownerId = (record && record.Owner && record.Owner.id) || FALLBACK_TASK_OWNER_ID;
+  const ownerId = (record && record.Owner && record.Owner.id) ||
+    (orgConfig && orgConfig.fallback_task_owner_id) || LEGACY_FALLBACK_TASK_OWNER_ID;
 
   const payload = JSON.stringify({
     data: [{
@@ -226,7 +259,7 @@ async function createReplyTask(token, leadId) {
     }]
   });
   const createRes = await requestJson({
-    hostname: apiHost(),
+    hostname: apiHost(orgConfig),
     path: '/crm/v2/Tasks',
     method: 'POST',
     headers: {
@@ -240,16 +273,23 @@ async function createReplyTask(token, leadId) {
     console.error('[crmLeads] createReplyTask failed for Lead ' + leadId + ': ' + String(createRes.body).slice(0, 300));
   }
 
-  await notifySignal(token, leadId, leadName);
+  await notifySignal(orgConfig, token, leadId, leadName);
 }
 
 // Must match a Signal created by hand in Setup > Experience Center >
 // Signals, with "Trigger Signal via: API" - Zoho auto-generates this from
 // the Label/Service entered there, this isn't something this code can
-// create itself. See zoho-signals-research memory note for the full setup
-// and the OAuth scope history (needs ZohoCRM.signals.ALL on top of the
-// Leads/Tasks scopes createReplyTask above needs).
-const SIGNAL_NAMESPACE = 'whatsyoo_newwhatsappmessage';
+// create itself, and it is per-org (each customer's Zoho org needs its own).
+// See zoho-signals-research memory note for the full setup and the OAuth
+// scope history (needs ZohoCRM.signals.ALL on top of the Leads/Tasks scopes
+// createReplyTask above needs).
+//
+// NOTE (multi-tenancy): the namespace below is specific to the legacy,
+// single-customer setup. On the shared backend this should come from
+// orgConfig (e.g. orgConfig.signal_namespace) once each installing org has
+// set up their own Signal - falls back to the legacy constant so existing
+// deployments keep working unmodified.
+const LEGACY_SIGNAL_NAMESPACE = 'whatsyoo_newwhatsappmessage';
 
 // Fires a Zoho Signal (the bell-icon notification) so an agent sees this
 // even in a CRM tab that's already open - createReplyTask() above is fast
@@ -259,21 +299,22 @@ const SIGNAL_NAMESPACE = 'whatsyoo_newwhatsappmessage';
 // that specific gap. Never throws - a Signals failure (e.g. missing scope,
 // or the Signal not yet existing in a customer's org) must not break Lead
 // sync or Task creation, which both already succeeded by this point.
-async function notifySignal(token, leadId, leadName) {
+async function notifySignal(orgConfig, token, leadId, leadName) {
+  const namespace = (orgConfig && orgConfig.signal_namespace) || LEGACY_SIGNAL_NAMESPACE;
   // Confirmed by a real failing call (Aug 12 2026): a flat payload gets
   // {"code":"MANDATORY_NOT_FOUND","details":{"api_name":"signals"}} -
   // same "wrap in a named array" convention Zoho uses for /Leads and
   // /Tasks ("data": [...]), just with "signals" as the key here instead.
   const payload = JSON.stringify({
     signals: [{
-      signal_namespace: SIGNAL_NAMESPACE,
+      signal_namespace: namespace,
       subject: 'New WhatsApp message',
       message: leadName + ' sent a new WhatsApp message.',
       id: leadId
     }]
   });
   const res = await requestJson({
-    hostname: apiHost(),
+    hostname: apiHost(orgConfig),
     path: '/crm/v2/signals/notifications',
     method: 'POST',
     headers: {
@@ -304,10 +345,10 @@ async function notifySignal(token, leadId, leadName) {
 //
 // Also fires createReplyTask() - see its own comment for why that lives
 // here now instead of in a Zoho Workflow Rule.
-async function markUnread(token, id) {
+async function markUnread(orgConfig, token, id) {
   const payload = JSON.stringify({ data: [{ id: id, WhatsApp_Unread: true, Last_WhatsApp_Message: zohoDateTime(new Date()) }] });
   const res = await requestJson({
-    hostname: apiHost(),
+    hostname: apiHost(orgConfig),
     path: '/crm/v2/Leads',
     method: 'PUT',
     headers: {
@@ -320,12 +361,12 @@ async function markUnread(token, id) {
   if (!(record && record.code === 'SUCCESS')) {
     console.error('[crmLeads] markUnread failed for Lead ' + id + ': ' + String(res.body).slice(0, 300));
   }
-  await createReplyTask(token, id);
+  await createReplyTask(orgConfig, token, id);
 }
 
-async function getLeadName(token, id) {
+async function getLeadName(orgConfig, token, id) {
   const res = await requestJson({
-    hostname: apiHost(),
+    hostname: apiHost(orgConfig),
     path: '/crm/v2/Leads/' + id + '?fields=Last_Name',
     method: 'GET',
     headers: { 'Authorization': 'Zoho-oauthtoken ' + token }
@@ -339,12 +380,12 @@ async function getLeadName(token, id) {
 // PUT if it needs fixing) - acceptable because this path only runs when
 // displayName is present, which only happens on START_CHAT, an infrequent
 // event compared to USER_MESSAGE.
-async function backfillIfNeeded(token, id, digits, displayName) {
-  const currentName = await getLeadName(token, id);
+async function backfillIfNeeded(orgConfig, token, id, digits, displayName) {
+  const currentName = await getLeadName(orgConfig, token, id);
   if (currentName !== fallbackName(digits)) {
     return 'existing Lead ' + id + ' (name already set)';
   }
-  const renamed = await updateLeadName(token, id, displayName);
+  const renamed = await updateLeadName(orgConfig, token, id, displayName);
   return 'existing Lead ' + id + ' (name ' + (renamed ? 'backfilled' : 'backfill FAILED') + ')';
 }
 
@@ -355,7 +396,7 @@ async function backfillIfNeeded(token, id, digits, displayName) {
 //
 // /upsert with duplicate_check_fields does the find-or-create atomically on
 // Zoho's side against live data, which closes that race entirely.
-async function upsertLead(token, digits, displayName) {
+async function upsertLead(orgConfig, token, digits, displayName) {
   // Last_Name is mandatory on Zoho Leads. WhatsApp gives us a profile name at
   // best, often nothing, so fall back to something identifiable rather than
   // failing the write.
@@ -377,7 +418,7 @@ async function upsertLead(token, digits, displayName) {
   });
 
   const res = await requestJson({
-    hostname: apiHost(),
+    hostname: apiHost(orgConfig),
     path: '/crm/v2/Leads/upsert',
     method: 'POST',
     headers: {
@@ -410,12 +451,23 @@ async function upsertLead(token, digits, displayName) {
 //   2. Catalyst Cache - survives across containers and cold starts
 // Once the search index catches up (well within the cache TTL) the search path
 // takes over, so nothing depends on the cache persisting.
+//
+// Cache keys are prefixed with the org id (multi-tenancy: on the shared
+// backend two different customers could otherwise have overlapping phone
+// digits collide in the same process-wide Map/Cache segment). Legacy
+// dedicated-project deployments have no orgConfig, so their prefix is just
+// "legacy" - harmless, since that deployment only ever serves one org anyway.
 const recentlyCreated = new Map();
 const RECENT_TTL_MS = 60 * 60 * 1000;
 const CACHE_TTL_HOURS = 6;
 
-function rememberLocally(digits, leadId) {
-  recentlyCreated.set(digits, { leadId: leadId, at: Date.now() });
+function tenantPrefix(orgConfig) {
+  return (orgConfig && orgConfig.org_id) || 'legacy';
+}
+
+function rememberLocally(orgConfig, digits, leadId) {
+  const key = tenantPrefix(orgConfig) + ':' + digits;
+  recentlyCreated.set(key, { leadId: leadId, at: Date.now() });
   // Cheap sweep so a long-lived container doesn't grow this forever.
   if (recentlyCreated.size > 500) {
     const cutoff = Date.now() - RECENT_TTL_MS;
@@ -425,20 +477,21 @@ function rememberLocally(digits, leadId) {
   }
 }
 
-function recallLocally(digits) {
-  const hit = recentlyCreated.get(digits);
+function recallLocally(orgConfig, digits) {
+  const key = tenantPrefix(orgConfig) + ':' + digits;
+  const hit = recentlyCreated.get(key);
   if (!hit) return null;
-  if (Date.now() - hit.at > RECENT_TTL_MS) { recentlyCreated.delete(digits); return null; }
+  if (Date.now() - hit.at > RECENT_TTL_MS) { recentlyCreated.delete(key); return null; }
   return hit.leadId;
 }
 
-function cacheKeyFor(digits) { return 'lead_' + digits; }
+function cacheKeyFor(orgConfig, digits) { return 'lead_' + tenantPrefix(orgConfig) + '_' + digits; }
 
-async function recallFromCache(catalystApp, digits) {
+async function recallFromCache(catalystApp, orgConfig, digits) {
   if (!catalystApp) return null;
   try {
     const segment = catalystApp.cache().segment();
-    const item = await segment.getValue(cacheKeyFor(digits));
+    const item = await segment.getValue(cacheKeyFor(orgConfig, digits));
     return item || null;
   } catch (e) {
     // Cache being unavailable must not stop us - worst case we fall through to
@@ -448,11 +501,11 @@ async function recallFromCache(catalystApp, digits) {
   }
 }
 
-async function rememberInCache(catalystApp, digits, leadId) {
+async function rememberInCache(catalystApp, orgConfig, digits, leadId) {
   if (!catalystApp) return;
   try {
     const segment = catalystApp.cache().segment();
-    await segment.put(cacheKeyFor(digits), String(leadId), CACHE_TTL_HOURS);
+    await segment.put(cacheKeyFor(orgConfig, digits), String(leadId), CACHE_TTL_HOURS);
   } catch (e) {
     console.error('[crmLeads] cache write failed: ' + (e && e.message));
   }
@@ -460,7 +513,10 @@ async function rememberInCache(catalystApp, digits, leadId) {
 
 // Returns a short string describing what happened, for the caller to log.
 // Never throws - a CRM problem must not break the webhook response to Engati.
-async function ensureLeadForPhone(catalystApp, userId, displayName) {
+//
+// `orgConfig` is the resolved OrgConfig row (or null for legacy dedicated-
+// project deployments, which fall back to process.env everywhere above).
+async function ensureLeadForPhone(catalystApp, orgConfig, userId, displayName) {
   const digits = String(userId || '').replace(/[^0-9]/g, '');
   // Web-channel sessions use UUIDs, not phone numbers. Those aren't contacts we
   // can create a Lead for, so skip rather than creating junk records.
@@ -479,46 +535,46 @@ async function ensureLeadForPhone(catalystApp, userId, displayName) {
   // real name would otherwise hit the cache and return before ever
   // comparing names - the placeholder would then persist for the entire
   // cache TTL (up to 6 hours) even though the real name was right there.
-  const localHit = recallLocally(digits);
+  const localHit = recallLocally(orgConfig, digits);
 
   try {
     // Fetched up front now, unlike before markUnread() existed - every
     // return path below (except the create/upsert one, which folds the
     // fields into its own write) now needs a token to mark the Lead
     // unread, so there is no longer a token-free fast path. getAccessToken()
-    // caches for an hour, so this is a cheap in-memory check on every call
-    // except the first per warm container.
-    const token = await getAccessToken();
+    // caches per-tenant for an hour, so this is a cheap in-memory check on
+    // every call except the first per warm container per tenant.
+    const token = await getAccessToken(orgConfig);
 
     if (localHit && !displayName) {
-      await markUnread(token, localHit);
+      await markUnread(orgConfig, token, localHit);
       return 'existing Lead ' + localHit + ' (in-process cache)';
     }
 
-    const cachedId = localHit || await recallFromCache(catalystApp, digits);
+    const cachedId = localHit || await recallFromCache(catalystApp, orgConfig, digits);
     if (cachedId && !displayName) {
-      rememberLocally(digits, cachedId);
-      await markUnread(token, cachedId);
+      rememberLocally(orgConfig, digits, cachedId);
+      await markUnread(orgConfig, token, cachedId);
       return 'existing Lead ' + cachedId + ' (Catalyst cache)';
     }
 
     if (cachedId) {
       // Already know the id - one GET to check the name, cheaper than a
       // fresh /search.
-      rememberLocally(digits, cachedId);
-      await rememberInCache(catalystApp, digits, cachedId);
-      await markUnread(token, cachedId);
-      return await backfillIfNeeded(token, cachedId, digits, displayName);
+      rememberLocally(orgConfig, digits, cachedId);
+      await rememberInCache(catalystApp, orgConfig, digits, cachedId);
+      await markUnread(orgConfig, token, cachedId);
+      return await backfillIfNeeded(orgConfig, token, cachedId, digits, displayName);
     }
 
     // Search covers established contacts, once the index has caught up.
-    const existing = await findLeadByPhone(token, digits);
+    const existing = await findLeadByPhone(orgConfig, token, digits);
     if (existing) {
-      rememberLocally(digits, existing.id);
-      await rememberInCache(catalystApp, digits, existing.id);
-      await markUnread(token, existing.id);
+      rememberLocally(orgConfig, digits, existing.id);
+      await rememberInCache(catalystApp, orgConfig, digits, existing.id);
+      await markUnread(orgConfig, token, existing.id);
       if (displayName && existing.Last_Name === fallbackName(digits)) {
-        const renamed = await updateLeadName(token, existing.id, displayName);
+        const renamed = await updateLeadName(orgConfig, token, existing.id, displayName);
         return 'existing Lead ' + existing.id + ' (matched by search, name ' + (renamed ? 'backfilled' : 'backfill FAILED') + ')';
       }
       return 'existing Lead ' + existing.id + ' (matched by search)';
@@ -528,10 +584,10 @@ async function ensureLeadForPhone(catalystApp, userId, displayName) {
     // Last_WhatsApp_Message - no separate markUnread() call needed here.
     // createReplyTask() is still needed explicitly though, since only
     // markUnread() calls it automatically.
-    const result = await upsertLead(token, digits, displayName);
-    rememberLocally(digits, result.id);
-    await rememberInCache(catalystApp, digits, result.id);
-    await createReplyTask(token, result.id);
+    const result = await upsertLead(orgConfig, token, digits, displayName);
+    rememberLocally(orgConfig, digits, result.id);
+    await rememberInCache(catalystApp, orgConfig, digits, result.id);
+    await createReplyTask(orgConfig, token, result.id);
     return result.action + ' Lead ' + result.id;
   } catch (e) {
     return 'FAILED: ' + ((e && e.message) || String(e));

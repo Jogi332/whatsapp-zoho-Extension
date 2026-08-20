@@ -155,12 +155,21 @@ module.exports = function (req, res) {
       }
       var sinceMs = Number(input.sinceMs) || 0;
       var app = catalyst.initialize(req);
-      // ZCQL has no parameter binding, so the phone is whitelisted to digits
-      // before interpolation - it's a channel-user id, never anything else.
+      // ZCQL has no parameter binding, so both the phone and orgId are
+      // whitelisted before interpolation - phone is a channel-user id
+      // (digits only), orgId is Zoho's own numeric org id (digits only).
+      // Multi-tenancy note: on the shared backend, orgId scoping is what
+      // stops org A from reading org B's delivery-failure packets just by
+      // guessing/knowing a phone number - see plan Phase D. Legacy
+      // dedicated-project deployments (no orgId sent, or rows written before
+      // this change) simply match against an empty org_id, which is fine
+      // since those deployments only ever hold one org's data anyway.
       var safePhone = String(phone).replace(/[^0-9]/g, '');
+      var safeOrgId = String(input.orgId || '').replace(/[^0-9]/g, '');
+      var orgClause = safeOrgId ? " AND org_id = '" + safeOrgId + "'" : '';
       app.zcql().executeZCQLQuery(
         "SELECT text_value, message_type, received_at, raw_payload FROM LiveChatEvents" +
-        " WHERE packet_type = 'STATUS_PACKET' AND user_id = '" + safePhone + "'" +
+        " WHERE packet_type = 'STATUS_PACKET' AND user_id = '" + safePhone + "'" + orgClause +
         " ORDER BY CREATEDTIME DESC LIMIT 50"
       ).then(function (rows) {
         var out = (rows || []).map(function (r) {

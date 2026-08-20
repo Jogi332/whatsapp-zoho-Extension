@@ -65,8 +65,51 @@
 // "TypeError: res.status is not a function" - confirmed via direct curl
 // test before this ever got wired into Engati's Configure screen.
 
+const https = require('https');
 const catalyst = require('zcatalyst-sdk-node');
 const { ensureLeadForPhone } = require('./crmLeads');
+const { findByWebhookSlug, slugFromUrl } = require('./orgConfig');
+
+// Calls this org's bundled Deluge Lead-sync function (deluge/leadSync.dg) -
+// see the call site's comment for why this direction (Catalyst calls
+// Deluge, not the reverse). Never rejects - a CRM-sync problem must not
+// affect Engati's 2xx, same contract ensureLeadForPhone already follows for
+// the legacy path.
+//
+// UNCONFIRMED: crm_function_url is the admin-pasted, full REST API URL
+// Zoho generates for the Function (URL + zapikey together per Zoho's own
+// docs - see deluge/leadSync.dg's SETUP section) - assumed to be a normal
+// HTTPS POST target needing no additional auth header, since the zapikey is
+// already embedded in the URL's query string per Zoho's documented shape.
+// Re-verify this against a real Function URL before trusting it.
+function callLeadSyncFunction(functionUrl, userId, displayName) {
+  return new Promise(function (resolve) {
+    var body;
+    var url;
+    try {
+      body = JSON.stringify({ userId: userId, displayName: displayName || '' });
+      url = new URL(functionUrl);
+    } catch (e) {
+      resolve('FAILED: invalid crm_function_url (' + (e && e.message) + ')');
+      return;
+    }
+    var req2 = https.request({
+      hostname: url.hostname,
+      path: url.pathname + url.search,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+    }, function (res2) {
+      var chunks = '';
+      res2.on('data', function (c) { chunks += c; });
+      res2.on('end', function () { resolve('statusCode=' + res2.statusCode + ' body=' + chunks.slice(0, 300)); });
+    });
+    req2.on('error', function (err) {
+      resolve('FAILED: ' + ((err && err.message) || String(err)));
+    });
+    req2.write(body);
+    req2.end();
+  });
+}
 
 function readBody(req) {
   return new Promise(function (resolve) {
@@ -102,7 +145,33 @@ function extractDisplayName(eventBody) {
 module.exports = function (req, res) {
   var headers = { 'Content-Type': 'application/json' };
 
-  readBody(req).then(function (raw) {
+  // MULTI-TENANCY (shared backend, see plan Phase A): Engati's payload
+  // itself carries no CRM org id anywhere, so tenant resolution goes through
+  // an opaque webhook_slug in the query string of the URL each org's admin
+  // pasted into Engati's Configure screen (Settings page, see plan Phase B).
+  // An unresolved slug (unknown, or a legacy dedicated-project deployment
+  // that never set one) must NOT block the 2xx response - Engati's own
+  // Configure-screen validation ping depends on this URL always answering
+  // 2xx, and a broken/typo'd slug shouldn't be able to brick that save.
+  var catalystApp = catalyst.initialize(req);
+  var slug = slugFromUrl(req.url);
+  // No slug at all = a legacy dedicated-project deployment (its Engati
+  // webhook URL predates the Settings-page-generated ?t= slug) - that mode
+  // is untouched, org resolution is simply skipped and everything below
+  // falls back to process.env, exactly as before this migration. A slug
+  // THAT DOESN'T MATCH any active OrgConfig row is a different, real
+  // problem (broken/typo'd/deactivated) and is logged loudly below.
+  var isLegacyMode = !slug;
+  var orgConfigPromise = slug ? findByWebhookSlug(catalystApp, slug) : Promise.resolve(null);
+
+  Promise.all([readBody(req), orgConfigPromise]).then(function (results) {
+    var raw = results[0];
+    var orgConfig = results[1];
+    var orgId = (orgConfig && orgConfig.org_id) || '';
+    if (!isLegacyMode && !orgConfig) {
+      console.error('[liveChatWebhook] no OrgConfig row for webhook_slug (unknown/inactive/typo\'d) - event will still 200 but nothing is stored. slug=' + slug);
+    }
+
     var body;
     try { body = JSON.parse(raw || '{}'); } catch (e) { body = {}; }
 
@@ -125,10 +194,16 @@ module.exports = function (req, res) {
     // reintroduce the same blank-text_value bug.
     if (body.externalPacketType === 'STATUS_PACKET' || body.type === 'STATUS_PACKET') {
       var statusBody = body.body || {};
-      console.log('[liveChatWebhook] STATUS_PACKET status=' + statusBody.status + ' code=' + statusBody.code + ' description=' + statusBody.description + ' userId=' + (body.userId || '') + ' botKey=' + (body.botKey || ''));
+      console.log('[liveChatWebhook] STATUS_PACKET status=' + statusBody.status + ' code=' + statusBody.code + ' description=' + statusBody.description + ' userId=' + (body.userId || '') + ' botKey=' + (body.botKey || '') + ' orgId=' + orgId);
 
-      var catalystAppForStatus = catalyst.initialize(req);
-      catalystAppForStatus.datastore().table('LiveChatEvents').insertRow({
+      if (!isLegacyMode && !orgId) {
+        res.writeHead(200, headers);
+        res.end(JSON.stringify({ ok: true, note: 'unresolved tenant - not stored' }));
+        return;
+      }
+
+      catalystApp.datastore().table('LiveChatEvents').insertRow({
+        org_id: orgId,
         packet_type: 'STATUS_PACKET',
         user_id: body.userId || '',
         bot_key: body.botKey || '',
@@ -150,6 +225,7 @@ module.exports = function (req, res) {
     }
 
     // Engati's own validation ping on Save is an empty-body POST - just ack it.
+    // This must succeed regardless of orgId resolution (see comment above).
     if (!body.externalPacketType) {
       res.writeHead(200, headers);
       res.end(JSON.stringify({ ok: true, note: 'no externalPacketType - treated as validation ping' }));
@@ -162,11 +238,21 @@ module.exports = function (req, res) {
     var botKey = body.botKey || '';
     var platform = body.platform || '';
 
-    console.log('[liveChatWebhook] packetType=' + packetType + ' userId=' + userId + ' botKey=' + botKey);
+    console.log('[liveChatWebhook] packetType=' + packetType + ' userId=' + userId + ' botKey=' + botKey + ' orgId=' + orgId);
 
-    var catalystApp = catalyst.initialize(req);
+    if (!isLegacyMode && !orgId) {
+      // Real event, unresolvable tenant - still 2xx (Engati's contract), but
+      // nothing useful can be stored or lead-synced without knowing which
+      // org's CRM to touch. Logged loudly above so this is visible in
+      // Catalyst logs rather than silently swallowed.
+      res.writeHead(200, headers);
+      res.end(JSON.stringify({ ok: true, note: 'unresolved tenant - not stored' }));
+      return;
+    }
+
     var table = catalystApp.datastore().table('LiveChatEvents');
     table.insertRow({
+      org_id: orgId,
       packet_type: packetType,
       user_id: userId,
       bot_key: botKey,
@@ -184,22 +270,59 @@ module.exports = function (req, res) {
     }).then(function () {
       // Auto-create a Zoho CRM Lead for contacts we haven't seen before.
       //
+      // IMPORTANT (corrected architecture, confirmed by Zoho Marketplace
+      // support - see email thread "Zoho CRM Extension Development - US DC
+      // Requirement & Connections Support Query", Aug 2026, and plan's
+      // "Correction" section): for the shared, multi-tenant extension path
+      // (isLegacyMode === false, i.e. orgId resolved via webhook_slug), this
+      // function does NOT do the CRM write itself anymore. Sigma/CRM
+      // extensions don't support "Connections" for third-party auth, and
+      // per-org Self Client OAuth (what crmLeads.js still does, for the
+      // legacy path only) is exactly what we were trying to avoid running
+      // per customer. Zoho's confirmed alternative: a REST-API-triggered
+      // Deluge Function bundled in the extension gets a per-installing-org
+      // URL + zapikey at setup time, and runs with IMPLICIT, tokenless CRM
+      // access to that org's data - see deluge/leadSync.dg (new, in this
+      // repo - Deluge is authored in Zoho's Sigma console, not deployable
+      // from this Node/Catalyst codebase).
+      //
+      // Call direction: THIS function calls that Deluge function (via a
+      // plain HTTPS POST to orgConfig.crm_function_url, the admin-pasted
+      // URL from the Settings page) - not the other way around. Engati's
+      // webhook target stays the Catalyst URL, unchanged; only the CRM
+      // write step is redirected. See callLeadSyncFunction() below.
+      //
+      // Legacy dedicated-project deployments (isLegacyMode === true) have no
+      // Deluge function in the picture at all - the OAuth-based
+      // ensureLeadForPhone path is still exactly how those keep working.
+      //
       // Runs on USER_MESSAGE rather than START_CHAT deliberately: START_CHAT
       // only fires when the bot flow reaches a Transfer to Agent node (often
       // never), and on the web channel its userId is a session UUID rather than
       // a phone number. USER_MESSAGE fires on every inbound WhatsApp message
       // and carries the real number.
       //
-      // ensureLeadForPhone never throws - it reports failures as a string - so
-      // a CRM outage or missing credentials can't stop Engati getting its 2xx.
-      // It's also idempotent (searches before creating), which matters because
-      // this runs on every single message.
-      if (packetType === 'USER_MESSAGE' || packetType === 'START_CHAT') {
-        return ensureLeadForPhone(catalystApp, userId, extractDisplayName(eventBody))
+      // Neither path throws on a CRM/network problem - a downstream failure
+      // can't stop Engati getting its 2xx. Both are idempotent-ish (the
+      // legacy path via search-before-create, the Deluge path via
+      // duplicate_check_fields), which matters because this runs on every
+      // single message.
+      if (packetType !== 'USER_MESSAGE' && packetType !== 'START_CHAT') {
+        return;
+      }
+      if (isLegacyMode) {
+        return ensureLeadForPhone(catalystApp, orgConfig, userId, extractDisplayName(eventBody))
           .then(function (outcome) {
             console.log('[liveChatWebhook] lead sync for ' + userId + ': ' + outcome);
           });
       }
+      if (orgConfig.crm_function_url) {
+        return callLeadSyncFunction(orgConfig.crm_function_url, userId, extractDisplayName(eventBody))
+          .then(function (outcome) {
+            console.log('[liveChatWebhook] Deluge lead sync for ' + userId + ': ' + outcome);
+          });
+      }
+      console.log('[liveChatWebhook] no crm_function_url set for orgId=' + orgId + ' - Lead sync skipped, see Settings page');
     }).catch(function (e) {
       console.error('[liveChatWebhook] lead sync threw unexpectedly: ' + (e && e.message));
     }).then(function () {

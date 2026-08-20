@@ -349,25 +349,65 @@ var ENGATI_INBOUND_API_KEY = null; // optional - only if this org set one up in 
 // messageId, errorCode:null) and never delivered - see ES-58715. See
 // SETUP.md for how to capture the real value on a new bot.
 var ENGATI_LIVECHAT_BOT_IDENTIFIER = null;
-// Each customer runs their OWN Catalyst project in their OWN Zoho account, but
-// they all load this one shared widget. So the Catalyst base URL cannot be
-// hardcoded - it must come from each org's own CRM Variables, exactly like the
-// Engati credentials do. Otherwise customer B's widget would call customer A's
-// Catalyst functions, which hold customer A's Engati credentials: wrong bot,
-// wrong messages, cross-customer data leak.
+// WorkDrive (attachments) - same CRM-Variables pattern as the Engati fields
+// above (see plan's "Correction" section: Zoho's confirmed guidance for
+// per-org third-party credentials is CRM Variables, not a custom Data Store
+// table - fileUpload no longer looks these up from OrgConfig). All optional
+// - attachments just stay unavailable for this org until set, same "not a
+// hard failure" treatment as ENGATI_INBOUND_MESSAGE_WEBHOOK_URL above.
+var WORKDRIVE_CLIENT_ID = null;
+var WORKDRIVE_CLIENT_SECRET = null;
+var WORKDRIVE_REFRESH_TOKEN = null;
+var WORKDRIVE_FOLDER_ID = null;
+var WORKDRIVE_ACCOUNTS_HOST = null;
+var WORKDRIVE_API_HOST = null;
+var WORKDRIVE_HOST = null;
+var WORKDRIVE_DOWNLOAD_HOST = null;
+// --- Multi-tenancy (Marketplace migration, see plan Phase A) ---------------
+// Historically each customer ran their OWN dedicated Catalyst project, and
+// the widget found it via a per-org CATALYST_BASE_URL CRM Variable
+// (applyCatalystBaseUrl below). That mode still works untouched, for
+// existing customers - see plan Phase F, no forced cutover.
 //
-// The value below is only a fallback for the original org, which predates the
-// CATALYST_BASE_URL variable. Any NEW org must set that variable - see SETUP.md.
-// Note the data centre suffix (.in): a customer on the US/EU/AU DC gets an
-// entirely different domain, not just a different project name.
-var DEFAULT_CATALYST_BASE_URL = "https://project-rainfall-60081410942.catalystserverless.in";
-var CATALYST_PROXY_URL = DEFAULT_CATALYST_BASE_URL + "/server/whatsappProxy/";
-var LIVE_CHAT_SENDER_PROXY_URL = DEFAULT_CATALYST_BASE_URL + "/server/liveChatSender/";
-var FILE_UPLOAD_PROXY_URL = DEFAULT_CATALYST_BASE_URL + "/server/fileUpload/";
+// New installs (via the Marketplace extension) don't get their own Catalyst
+// project at all: they share ONE multi-tenant backend, and every request
+// carries this org's CRM org id (CURRENT_ORG_ID) so the shared functions can
+// look up that org's Engati/CRM/WorkDrive config from the OrgConfig table
+// instead of from process-wide env vars. See functions/liveChatSender,
+// functions/liveChatWebhook, functions/fileUpload, functions/whatsappProxy.
+//
+// SHARED_CATALYST_BASE_URL itself lives in sharedConfig.js (loaded before
+// this file, see index.html) so it can't drift out of sync with settings.js's
+// copy - see that file's header comment for the deploy TODO.
+// NOT read automatically anymore (see below) - this used to be the silent
+// fallback for the one legacy org that predates the CATALYST_BASE_URL
+// variable. Auto-falling-back to one specific customer's project is exactly
+// the cross-tenant leak this migration removes: ANY org that forgets to set
+// CATALYST_BASE_URL now falls back to the shared multi-tenant backend
+// instead (safe, org-scoped via CURRENT_ORG_ID). That one legacy org must
+// therefore have this value set as its explicit CATALYST_BASE_URL variable
+// (a one-time, no-code migration step) - kept here only as the value to
+// paste in for that.
+var LEGACY_DEFAULT_CATALYST_BASE_URL = "https://project-rainfall-60081410942.catalystserverless.in"; // eslint-disable-line no-unused-vars
+var CATALYST_PROXY_URL = SHARED_CATALYST_BASE_URL + "/server/whatsappProxy/";
+var LIVE_CHAT_SENDER_PROXY_URL = SHARED_CATALYST_BASE_URL + "/server/liveChatSender/";
+var FILE_UPLOAD_PROXY_URL = SHARED_CATALYST_BASE_URL + "/server/fileUpload/";
+// Set once per session by loadConfigFromVariables(). Every backend POST body
+// should include this as `orgId` so shared, multi-tenant functions can
+// resolve which OrgConfig row to use. Harmless to send even in legacy
+// dedicated-project mode - those functions just ignore the extra field.
+//
+// TODO(verify): ZOHO.CRM.CONFIG.getOrgInfo()'s exact response shape hasn't
+// been confirmed against a live widget yet - the field used below (ZGID) is
+// this SDK's documented org identifier, but re-check against the real
+// response (see showDebug logging in loadConfigFromVariables) before relying
+// on it for tenant isolation in production.
+var CURRENT_ORG_ID = null;
 var configReadyPromise = null;
 
-// Builds the three function endpoints from whatever base URL this org supplied.
-// Tolerates a trailing slash, and a value that already includes "/server".
+// Builds the three function endpoints from whatever base URL this org
+// explicitly supplied (legacy dedicated-project mode only). Tolerates a
+// trailing slash, and a value that already includes "/server".
 function applyCatalystBaseUrl(baseUrl){
 var base = String(baseUrl || '').trim().replace(/\/+$/, '');
 if(!base){ return false; }
@@ -388,7 +428,16 @@ function loadConfigFromVariables(){
     ZOHO.CRM.API.getOrgVariable("ENGATI_INBOUND_API_KEY"),
     ZOHO.CRM.API.getOrgVariable("CATALYST_BASE_URL"),
     ZOHO.CRM.API.getOrgVariable("DEFAULT_COUNTRY_CODE"),
-    ZOHO.CRM.API.getOrgVariable("ENGATI_LIVECHAT_BOT_IDENTIFIER")
+    ZOHO.CRM.API.getOrgVariable("ENGATI_LIVECHAT_BOT_IDENTIFIER"),
+    ZOHO.CRM.CONFIG.getOrgInfo(),
+    ZOHO.CRM.API.getOrgVariable("WORKDRIVE_CLIENT_ID"),
+    ZOHO.CRM.API.getOrgVariable("WORKDRIVE_CLIENT_SECRET"),
+    ZOHO.CRM.API.getOrgVariable("WORKDRIVE_REFRESH_TOKEN"),
+    ZOHO.CRM.API.getOrgVariable("WORKDRIVE_FOLDER_ID"),
+    ZOHO.CRM.API.getOrgVariable("WORKDRIVE_ACCOUNTS_HOST"),
+    ZOHO.CRM.API.getOrgVariable("WORKDRIVE_API_HOST"),
+    ZOHO.CRM.API.getOrgVariable("WORKDRIVE_HOST"),
+    ZOHO.CRM.API.getOrgVariable("WORKDRIVE_DOWNLOAD_HOST")
   ]).then(function(results){
     showDebug('getOrgVariable raw response[0]: ' + JSON.stringify(results[0]).slice(0,500));
     showDebug('getOrgVariable raw response[1]: ' + JSON.stringify(results[1]).slice(0,500));
@@ -400,12 +449,24 @@ function loadConfigFromVariables(){
     // failure) if these aren't set for this org yet.
     ENGATI_INBOUND_MESSAGE_WEBHOOK_URL = (results[3] && results[3].Success && results[3].Success.Content) || null;
     ENGATI_INBOUND_API_KEY = (results[4] && results[4].Success && results[4].Success.Content) || null;
-    // Point this org's widget at this org's own Catalyst project.
+
+    // This org's CRM org id - needed on every shared-backend call so the
+    // multi-tenant functions can resolve its OrgConfig row. See TODO on
+    // CURRENT_ORG_ID's declaration re: verifying this response shape.
+    showDebug('getOrgInfo raw response: ' + JSON.stringify(results[8]).slice(0,500));
+    var orgInfo = results[8] && results[8].org && results[8].org[0];
+    CURRENT_ORG_ID = (orgInfo && (orgInfo.ZGID || orgInfo.id)) || null;
+    if(!CURRENT_ORG_ID){
+      showDebug('WARNING: could not resolve CURRENT_ORG_ID from getOrgInfo() - shared multi-tenant backend calls will be unscoped until this is fixed.');
+    }
+
+    // Legacy dedicated-project mode, unchanged: if this org explicitly set
+    // CATALYST_BASE_URL, point at their own Catalyst project.
     var catalystBaseUrl = (results[5] && results[5].Success && results[5].Success.Content) || null;
     if(applyCatalystBaseUrl(catalystBaseUrl)){
-      showDebug('CATALYST_BASE_URL from org variable: ' + catalystBaseUrl);
+      showDebug('CATALYST_BASE_URL from org variable (legacy dedicated-project mode): ' + catalystBaseUrl);
     } else {
-      showDebug('WARNING: CATALYST_BASE_URL not set for this org - falling back to ' + DEFAULT_CATALYST_BASE_URL + '. Every org except the original one MUST set this variable, or it will call the wrong customer\'s Catalyst functions. See SETUP.md.');
+      showDebug('CATALYST_BASE_URL not set for this org - using the shared multi-tenant backend (org-scoped via CURRENT_ORG_ID), see SETUP.md.');
     }
     // Country code applied only to phone numbers stored without one.
     var countryCode = (results[6] && results[6].Success && results[6].Success.Content) || null;
@@ -423,6 +484,19 @@ function loadConfigFromVariables(){
     if(!ENGATI_LIVECHAT_BOT_IDENTIFIER){
       showDebug('ENGATI_LIVECHAT_BOT_IDENTIFIER not set - free-text sending will be accepted by Engati but silently never delivered. See SETUP.md.');
     }
+
+    WORKDRIVE_CLIENT_ID = (results[9] && results[9].Success && results[9].Success.Content) || null;
+    WORKDRIVE_CLIENT_SECRET = (results[10] && results[10].Success && results[10].Success.Content) || null;
+    WORKDRIVE_REFRESH_TOKEN = (results[11] && results[11].Success && results[11].Success.Content) || null;
+    WORKDRIVE_FOLDER_ID = (results[12] && results[12].Success && results[12].Success.Content) || null;
+    WORKDRIVE_ACCOUNTS_HOST = (results[13] && results[13].Success && results[13].Success.Content) || null;
+    WORKDRIVE_API_HOST = (results[14] && results[14].Success && results[14].Success.Content) || null;
+    WORKDRIVE_HOST = (results[15] && results[15].Success && results[15].Success.Content) || null;
+    WORKDRIVE_DOWNLOAD_HOST = (results[16] && results[16].Success && results[16].Success.Content) || null;
+    if(!WORKDRIVE_CLIENT_ID || !WORKDRIVE_REFRESH_TOKEN || !WORKDRIVE_FOLDER_ID){
+      showDebug('WorkDrive CRM Variables not fully set for this org - file attachments will be unavailable until WORKDRIVE_CLIENT_ID/CLIENT_SECRET/REFRESH_TOKEN/FOLDER_ID are set. See SETUP.md.');
+    }
+
     if(!ENGATI_CUSTOMER_ID || !ENGATI_BOT_ID || !ENGATI_API_KEY){
       renderStatus('WhatsApp integration is not configured. Please set ENGATI_CUSTOMER_ID, ENGATI_BOT_ID and ENGATI_API_KEY under Setup > Developer Hub > Variables.');
       throw new Error('Missing configuration variables');
@@ -506,7 +580,7 @@ return fetch(LIVE_CHAT_SENDER_PROXY_URL, {
 method: 'POST',
 // text/plain to stay a CORS "simple request" - see sendFreeTextMessage().
 headers: { 'Content-Type': 'text/plain' },
-body: JSON.stringify({ action: 'getStatusPackets', phone: phone })
+body: JSON.stringify({ action: 'getStatusPackets', phone: phone, orgId: CURRENT_ORG_ID })
 }).then(function(r){ return r.text(); }).then(function(raw){
 var outer = safeParse(raw);
 var inner = outer && safeParse(outer.body);
@@ -652,7 +726,7 @@ var targetPlatform = currentEngatiPlatform || 'dialog360';
 // comment near the top of this file. Engati silently accepts and drops
 // AGENT_MESSAGE packets that carry the wrong one (confirmed by testing,
 // not documented - ES-58715). See catalyst-functions/liveChatSender/index.js.
-var body = { action: 'sendAgentMessage', phone: targetUserId, platform: targetPlatform, botKey: ENGATI_BOT_ID, botIdentifier: ENGATI_LIVECHAT_BOT_IDENTIFIER, inboundMessageWebhookUrl: ENGATI_INBOUND_MESSAGE_WEBHOOK_URL };
+var body = { action: 'sendAgentMessage', orgId: CURRENT_ORG_ID, phone: targetUserId, platform: targetPlatform, botKey: ENGATI_BOT_ID, botIdentifier: ENGATI_LIVECHAT_BOT_IDENTIFIER, inboundMessageWebhookUrl: ENGATI_INBOUND_MESSAGE_WEBHOOK_URL };
 if(ENGATI_INBOUND_API_KEY){ body.inboundApiKey = ENGATI_INBOUND_API_KEY; }
 if(text){ body.text = text; }
 if(media && media.value){ body.media = { value: media.value, mimeType: media.mimeType }; }
@@ -779,7 +853,7 @@ language: { code: (document.getElementById('tplLanguageSelect') || {}).value || 
 }
 
 function sendTemplateMessage(phone, rec){
-var url = "https://api.engati.ai/whatsapp-api/v1.0/customer/" + ENGATI_CUSTOMER_ID + "/bot/" + ENGATI_BOT_ID + "/template"; return fetch(CATALYST_PROXY_URL, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: JSON.stringify({ action: 'sendTemplate', phone: phone, templatePayload: buildTemplatePayload(rec) }) }).then(function(r){ return r.text(); });
+var url = "https://api.engati.ai/whatsapp-api/v1.0/customer/" + ENGATI_CUSTOMER_ID + "/bot/" + ENGATI_BOT_ID + "/template"; return fetch(CATALYST_PROXY_URL, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: JSON.stringify({ action: 'sendTemplate', orgId: CURRENT_ORG_ID, phone: phone, engatiCustomerId: ENGATI_CUSTOMER_ID, engatiBotId: ENGATI_BOT_ID, engatiApiKey: ENGATI_API_KEY, templatePayload: buildTemplatePayload(rec) }) }).then(function(r){ return r.text(); });
 var body = {
 phoneNumber: '+' + phone,
 payload: buildTemplatePayload(rec)
@@ -791,7 +865,7 @@ body: (function(){ showDebug('outgoing body (raw object, with content-type heade
 });
 }
 
-function sendTemplateViaProxy(phone, rec){ return fetch(CATALYST_PROXY_URL, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: JSON.stringify({ action: 'sendTemplate', phone: phone, templatePayload: buildTemplatePayload(rec) }) }).then(function(r){ return r.text(); }); } document.getElementById('templateSelect').addEventListener('change', function(){
+function sendTemplateViaProxy(phone, rec){ return fetch(CATALYST_PROXY_URL, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: JSON.stringify({ action: 'sendTemplate', orgId: CURRENT_ORG_ID, phone: phone, engatiCustomerId: ENGATI_CUSTOMER_ID, engatiBotId: ENGATI_BOT_ID, engatiApiKey: ENGATI_API_KEY, templatePayload: buildTemplatePayload(rec) }) }).then(function(r){ return r.text(); }); } document.getElementById('templateSelect').addEventListener('change', function(){
 var rec = templatesById[this.value];
 renderTemplateParams(rec);
 });
@@ -1274,7 +1348,9 @@ return readFileAsBase64(file).then(function(dataBase64){
 return fetch(FILE_UPLOAD_PROXY_URL, {
 method: 'POST',
 headers: { 'Content-Type': 'text/plain' },
-body: JSON.stringify({ filename: file.name, mimeType: file.type, dataBase64: dataBase64 })
+body: JSON.stringify({ orgId: CURRENT_ORG_ID, filename: file.name, mimeType: file.type, dataBase64: dataBase64,
+  workdriveClientId: WORKDRIVE_CLIENT_ID, workdriveClientSecret: WORKDRIVE_CLIENT_SECRET, workdriveRefreshToken: WORKDRIVE_REFRESH_TOKEN, workdriveFolderId: WORKDRIVE_FOLDER_ID,
+  workdriveAccountsHost: WORKDRIVE_ACCOUNTS_HOST, workdriveApiHost: WORKDRIVE_API_HOST, workdriveHost: WORKDRIVE_HOST, workdriveDownloadHost: WORKDRIVE_DOWNLOAD_HOST })
 });
 }).then(function(r){ return r.text(); });
 }

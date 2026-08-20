@@ -93,6 +93,18 @@
 const https = require('https');
 const crypto = require('crypto');
 const catalyst = require('zcatalyst-sdk-node');
+// MULTI-TENANCY: CORRECTED (see plan's "Correction" section, confirmed by
+// Zoho Marketplace support) - WorkDrive credentials are NOT looked up from
+// a shared Data Store table. Same reasoning/pattern as whatsappProxy's
+// Engati fix: the widget already reads these from CRM Variables (see
+// app.js's WORKDRIVE_* globals) and passes them straight through on every
+// upload request. Every function below that takes an `orgConfig`-shaped
+// argument is really just being handed a plain object built from the
+// request body in handleUpload() - the property names
+// (workdrive_client_id etc.) are kept identical to what the old OrgConfig
+// row shape used, so none of these helper functions needed to change.
+// Null/missing = legacy dedicated-project deployment, falls back to
+// process.env exactly as originally built.
 
 function readBody(req) {
   return new Promise(function (resolve) {
@@ -122,27 +134,28 @@ function requestJson(options, body) {
   });
 }
 
-function accountsHost() { return process.env.WORKDRIVE_ACCOUNTS_HOST || 'accounts.zoho.in'; }
-function apiHost() { return process.env.WORKDRIVE_API_HOST || 'www.zohoapis.in'; }
-function workdriveHost() { return process.env.WORKDRIVE_HOST || 'workdrive.zoho.in'; }
-function downloadHost() { return process.env.WORKDRIVE_DOWNLOAD_HOST || 'files-accl.zohoexternal.in'; }
+function accountsHost(orgConfig) { return (orgConfig && orgConfig.workdrive_accounts_host) || process.env.WORKDRIVE_ACCOUNTS_HOST || 'accounts.zoho.in'; }
+function apiHost(orgConfig) { return (orgConfig && orgConfig.workdrive_api_host) || process.env.WORKDRIVE_API_HOST || 'www.zohoapis.in'; }
+function workdriveHost(orgConfig) { return (orgConfig && orgConfig.workdrive_host) || process.env.WORKDRIVE_HOST || 'workdrive.zoho.in'; }
+function downloadHost(orgConfig) { return (orgConfig && orgConfig.workdrive_download_host) || process.env.WORKDRIVE_DOWNLOAD_HOST || 'files-accl.zohoexternal.in'; }
 
-// Access tokens last an hour. Cache across warm invocations, same pattern
-// as crmLeads.js's getAccessToken - separate cache variables because this
-// is a WorkDrive-scoped token, not the CRM one liveChatWebhook uses.
-var cachedToken = null;
-var cachedTokenExpiresAt = 0;
+// Access tokens last an hour. Cached PER TENANT (keyed by client id), same
+// reasoning as crmLeads.js's tokenCache - a single shared module-level token
+// would leak org A's WorkDrive access into org B's upload on this shared
+// backend.
+var tokenCache = new Map(); // clientId -> { token, expiresAt }
 
-async function getAccessToken() {
-  var now = Date.now();
-  if (cachedToken && now < cachedTokenExpiresAt - 60000) { return cachedToken; }
-
-  var clientId = process.env.WORKDRIVE_CLIENT_ID;
-  var clientSecret = process.env.WORKDRIVE_CLIENT_SECRET;
-  var refreshToken = process.env.WORKDRIVE_REFRESH_TOKEN;
+async function getAccessToken(orgConfig) {
+  var clientId = (orgConfig && orgConfig.workdrive_client_id) || process.env.WORKDRIVE_CLIENT_ID;
+  var clientSecret = (orgConfig && orgConfig.workdrive_client_secret) || process.env.WORKDRIVE_CLIENT_SECRET;
+  var refreshToken = (orgConfig && orgConfig.workdrive_refresh_token) || process.env.WORKDRIVE_REFRESH_TOKEN;
   if (!clientId || !clientSecret || !refreshToken) {
-    throw new Error('WorkDrive credentials not configured (WORKDRIVE_CLIENT_ID / WORKDRIVE_CLIENT_SECRET / WORKDRIVE_REFRESH_TOKEN)');
+    throw new Error('WorkDrive credentials not configured for this tenant (client id / secret / refresh token)');
   }
+
+  var now = Date.now();
+  var cached = tokenCache.get(clientId);
+  if (cached && now < cached.expiresAt - 60000) { return cached.token; }
 
   var form = 'grant_type=refresh_token'
     + '&client_id=' + encodeURIComponent(clientId)
@@ -150,7 +163,7 @@ async function getAccessToken() {
     + '&refresh_token=' + encodeURIComponent(refreshToken);
 
   var res = await requestJson({
-    hostname: accountsHost(),
+    hostname: accountsHost(orgConfig),
     path: '/oauth/v2/token',
     method: 'POST',
     headers: {
@@ -164,8 +177,7 @@ async function getAccessToken() {
     throw new Error('WorkDrive token refresh failed (' + res.statusCode + '): ' + String(res.body).slice(0, 300));
   }
   var expiresInSec = (res.json && res.json.expires_in) || 3600;
-  cachedToken = token;
-  cachedTokenExpiresAt = Date.now() + expiresInSec * 1000;
+  tokenCache.set(clientId, { token: token, expiresAt: Date.now() + expiresInSec * 1000 });
   return token;
 }
 
@@ -182,10 +194,10 @@ function buildMultipart(filename, mimeType, buffer) {
   return { boundary: boundary, body: body };
 }
 
-async function uploadFile(token, filename, mimeType, buffer) {
-  var folderId = process.env.WORKDRIVE_FOLDER_ID;
+async function uploadFile(orgConfig, token, filename, mimeType, buffer) {
+  var folderId = (orgConfig && orgConfig.workdrive_folder_id) || process.env.WORKDRIVE_FOLDER_ID;
   if (!folderId) {
-    throw new Error('WORKDRIVE_FOLDER_ID not configured - see SETUP.md for how to find your WorkDrive folder id');
+    throw new Error('WorkDrive folder id not configured for this tenant - see SETUP.md for how to find it');
   }
   var multipart = buildMultipart(filename, mimeType, buffer);
   var path = '/workdrive/api/v1/upload'
@@ -194,7 +206,7 @@ async function uploadFile(token, filename, mimeType, buffer) {
     + '&override-name-exist=true';
 
   var res = await requestJson({
-    hostname: apiHost(),
+    hostname: apiHost(orgConfig),
     path: path,
     method: 'POST',
     headers: {
@@ -217,7 +229,7 @@ async function uploadFile(token, filename, mimeType, buffer) {
 // required even when empty; omitting any one produces the same generic
 // 500 as calling the wrong host, so don't "clean this up" without testing
 // against a real upload again.
-async function createPublicLink(token, resourceId, linkName) {
+async function createPublicLink(orgConfig, token, resourceId, linkName) {
   var payload = JSON.stringify({
     data: {
       attributes: {
@@ -234,7 +246,7 @@ async function createPublicLink(token, resourceId, linkName) {
   });
 
   var res = await requestJson({
-    hostname: workdriveHost(),
+    hostname: workdriveHost(orgConfig),
     path: '/api/v1/links',
     method: 'POST',
     headers: {
@@ -255,14 +267,14 @@ async function createPublicLink(token, resourceId, linkName) {
 // The real WorkDrive URL - byte-correct, but NOT what gets handed to
 // WhatsApp (see file header). Only used internally by the /media proxy
 // route below.
-function buildWorkdriveDownloadUrl(resourceId, linkId) {
+function buildWorkdriveDownloadUrl(orgConfig, resourceId, linkId) {
   var xCliMsg = JSON.stringify({
     linkId: linkId,
     isFileOwner: false,
     version: '1.0',
     isWDSupport: false
   });
-  return 'https://' + downloadHost() + '/public/workdrive-external/download/'
+  return 'https://' + downloadHost(orgConfig) + '/public/workdrive-external/download/'
     + encodeURIComponent(resourceId) + '?x-cli-msg=' + encodeURIComponent(xCliMsg);
 }
 
@@ -290,11 +302,26 @@ function buildWorkdriveDownloadUrl(resourceId, linkId) {
 // actually complain about old attachments going blank.
 var MEDIA_CACHE_TTL_HOURS = 48;
 
+// shortId itself is a crypto.randomBytes(9) opaque token (~2^72 space) - not
+// namespaced per-org here deliberately. GET /media only ever receives the
+// shortId (WhatsApp fetches the exact URL this function handed back, with
+// no org context of any kind), so true per-org namespacing of the cache key
+// would need embedding an org identifier into the WhatsApp-facing URL - and
+// that URL's shape is under active, fragile investigation (see plan Phase E
+// / file header re: Meta's media fetcher rejecting anything but a short
+// plain-path URL). Not worth risking a second unproven variable while that
+// investigation is open; the random id's collision space is the isolation
+// mechanism instead.
 function mediaCacheKey(shortId) { return 'wdmedia_' + shortId; }
 
-async function rememberMedia(catalystApp, shortId, resourceId, linkId, mimeType) {
+// downloadHostOverride is stored alongside the mapping (not just resolved
+// fresh from orgConfig at upload time) because streamMedia() below has no
+// org context at GET time either - see the comment above. Storing it here
+// is what lets a customer on a non-default WorkDrive data centre still get
+// the right download host reconstructed later.
+async function rememberMedia(catalystApp, shortId, resourceId, linkId, mimeType, downloadHostOverride) {
   var segment = catalystApp.cache().segment();
-  var value = JSON.stringify({ resourceId: resourceId, linkId: linkId, mimeType: mimeType });
+  var value = JSON.stringify({ resourceId: resourceId, linkId: linkId, mimeType: mimeType, downloadHost: downloadHostOverride || null });
   await segment.put(mediaCacheKey(shortId), value, MEDIA_CACHE_TTL_HOURS);
 }
 
@@ -365,6 +392,22 @@ function shortIdFromUrl(url) {
 // buffering is cheap at these file sizes (capped at MAX_UPLOAD_BYTES) and
 // removes the variable entirely rather than leaving it as an open
 // question.
+// BUG FOUND BY CODE REVIEW (Phase E, not yet confirmed by a real send - see
+// note at the fix site below): module.exports below only ever routed
+// `req.method === 'GET'` here. A HEAD request to the exact same
+// `?id=<shortId>` URL fell through to handleUpload() instead - which reads
+// an empty body and returns a 200-wrapped `{statusCode:400, "filename and
+// dataBase64 required"}` JSON error, not real media headers. Many media-
+// fetching clients issue a preliminary HEAD probe (checking Content-Length/
+// Content-Type against platform size/type limits) before the real GET -
+// if WhatsApp's business media fetcher does this, it would receive that
+// nonsense JSON instead of valid headers and could reject the attachment
+// silently, asynchronously - which is an exact match for the reported
+// symptom (Engati's API accepts the send with a real messageId, but the
+// media never arrives on the phone). This is a genuinely plausible root
+// cause identified via static review; it has NOT been confirmed against a
+// real WhatsApp send - do that before considering this "the" fix rather
+// than "a" fix. See module.exports below for the routing correction.
 function streamMedia(req, res) {
   var shortId = shortIdFromUrl(req.url);
   if (!shortId) {
@@ -372,17 +415,25 @@ function streamMedia(req, res) {
     res.end(JSON.stringify({ error: 'missing media id' }));
     return;
   }
+  var isHead = req.method === 'HEAD';
 
   var catalystApp = catalyst.initialize(req);
   recallMedia(catalystApp, shortId).then(function (mapping) {
     if (!mapping) {
       res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'unknown or expired attachment id' }));
+      res.end(isHead ? undefined : JSON.stringify({ error: 'unknown or expired attachment id' }));
       return;
     }
 
-    var workdriveUrl = buildWorkdriveDownloadUrl(mapping.resourceId, mapping.linkId);
+    var workdriveUrl = buildWorkdriveDownloadUrl({ workdrive_download_host: mapping.downloadHost }, mapping.resourceId, mapping.linkId);
     var parsed = new URL(workdriveUrl);
+    // Always issues a real upstream GET, even for a HEAD request - simplest
+    // correct behaviour (guarantees an accurate Content-Length) rather than
+    // trusting WorkDrive's own HEAD support, which isn't confirmed. Slightly
+    // wasteful (fetches the whole file just to answer a HEAD) but this path
+    // is rare enough (one probe per attachment, not per byte) that it's not
+    // worth the complexity of a separate upstream HEAD until proven to
+    // matter.
     var upstreamReq = https.request({
       hostname: parsed.hostname,
       path: parsed.pathname + parsed.search,
@@ -399,24 +450,24 @@ function streamMedia(req, res) {
           'Access-Control-Allow-Origin': '*',
           'Cache-Control': 'public, max-age=86400'
         });
-        res.end(buffer);
+        res.end(isHead ? undefined : buffer);
       });
       upstreamRes.on('error', function (err) {
         console.error('[fileUpload] media proxy response read failed: ' + (err && err.message));
         res.writeHead(502, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'failed to read attachment' }));
+        res.end(isHead ? undefined : JSON.stringify({ error: 'failed to read attachment' }));
       });
     });
     upstreamReq.on('error', function (err) {
       console.error('[fileUpload] media proxy fetch failed: ' + (err && err.message));
       res.writeHead(502, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'failed to fetch attachment' }));
+      res.end(isHead ? undefined : JSON.stringify({ error: 'failed to fetch attachment' }));
     });
     upstreamReq.end();
   }).catch(function (e) {
     console.error('[fileUpload] media cache lookup failed: ' + (e && e.message));
     res.writeHead(502, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'attachment lookup failed' }));
+    res.end(isHead ? undefined : JSON.stringify({ error: 'attachment lookup failed' }));
   });
 }
 
@@ -458,6 +509,7 @@ function handleUpload(req, res) {
     var filename = input.filename;
     var mimeType = input.mimeType;
     var dataBase64 = input.dataBase64;
+    var orgId = input.orgId;
 
     if (!filename || !dataBase64) {
       res.writeHead(200, headers);
@@ -488,11 +540,31 @@ function handleUpload(req, res) {
 
     var catalystApp = catalyst.initialize(req);
 
-    getAccessToken()
-      .then(function (token) {
-        return uploadFile(token, filename, mimeType, buffer).then(function (resourceId) {
-          return createPublicLink(token, resourceId, filename).then(function (linkId) {
-            return { resourceId: resourceId, linkId: linkId };
+    // Credentials come straight from the request body now (widget-supplied,
+    // sourced from CRM Variables) - see file header. `orgConfig`-shaped only
+    // to avoid touching the helper functions below; not an actual lookup
+    // result. Falls back to process.env inside each accessor function
+    // (accountsHost/apiHost/etc., getAccessToken, uploadFile) if a given
+    // field wasn't sent - legacy dedicated-project deployments send none of
+    // these at all and work unchanged.
+    var orgConfig = {
+      workdrive_client_id: input.workdriveClientId,
+      workdrive_client_secret: input.workdriveClientSecret,
+      workdrive_refresh_token: input.workdriveRefreshToken,
+      workdrive_folder_id: input.workdriveFolderId,
+      workdrive_accounts_host: input.workdriveAccountsHost,
+      workdrive_api_host: input.workdriveApiHost,
+      workdrive_host: input.workdriveHost,
+      workdrive_download_host: input.workdriveDownloadHost
+    };
+
+    Promise.resolve()
+      .then(function () {
+        return getAccessToken(orgConfig).then(function (token) {
+          return uploadFile(orgConfig, token, filename, mimeType, buffer).then(function (resourceId) {
+            return createPublicLink(orgConfig, token, resourceId, filename).then(function (linkId) {
+              return { orgConfig: orgConfig, resourceId: resourceId, linkId: linkId };
+            });
           });
         });
       })
@@ -507,7 +579,8 @@ function handleUpload(req, res) {
         // one that doesn't, so there's no reason not to do it too.
         var ext = extensionFromFilename(filename);
         var shortId = crypto.randomBytes(9).toString('base64url') + (ext ? '.' + ext : '');
-        return rememberMedia(catalystApp, shortId, result.resourceId, result.linkId, mimeType).then(function () {
+        var downloadHostOverride = result.orgConfig && result.orgConfig.workdrive_download_host;
+        return rememberMedia(catalystApp, shortId, result.resourceId, result.linkId, mimeType, downloadHostOverride).then(function () {
           return shortId;
         });
       })
@@ -517,7 +590,7 @@ function handleUpload(req, res) {
         res.end(JSON.stringify({ statusCode: 200, body: JSON.stringify({ url: url, filename: filename, mimeType: mimeType }) }));
       })
       .catch(function (e) {
-        console.error('[fileUpload] failed: ' + (e && e.message));
+        console.error('[fileUpload] failed for orgId=' + orgId + ': ' + (e && e.message));
         res.writeHead(200, headers);
         res.end(JSON.stringify({ statusCode: 502, body: JSON.stringify({ error: (e && e.message) || String(e) }) }));
       });
@@ -528,14 +601,19 @@ module.exports = function (req, res) {
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
+      'Access-Control-Allow-Methods': 'POST, GET, HEAD, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type'
     });
     res.end();
     return;
   }
 
-  if (req.method === 'GET' && shortIdFromUrl(req.url)) {
+  // See streamMedia's header comment (Phase E finding) - HEAD must route
+  // here too, not just GET. A media-fetching client's preliminary HEAD
+  // probe falling through to handleUpload() below (which expects an
+  // upload POST body) is the leading suspect for why attachments were
+  // silently rejected - fixed here, not yet confirmed with a real send.
+  if ((req.method === 'GET' || req.method === 'HEAD') && shortIdFromUrl(req.url)) {
     streamMedia(req, res);
     return;
   }

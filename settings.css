@@ -1,0 +1,105 @@
+/* settings.css - minimal styling for settings.html (plan Phase B).
+   Deliberately not sharing style.css's widget-panel layout rules (that
+   file targets the narrow related-list panel; this page renders as a
+   full-width CRM System Settings page) - kept separate rather than trying
+   to make one stylesheet serve both without fighting itself. */
+
+#settingsRoot {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 24px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  color: #1f2430;
+}
+
+#settingsRoot h1 {
+  font-size: 20px;
+  margin-bottom: 4px;
+}
+
+.settingsIntro {
+  color: #5c6470;
+  margin-bottom: 20px;
+  font-size: 13px;
+}
+
+.settingsStatus {
+  min-height: 20px;
+  margin-bottom: 12px;
+  font-size: 13px;
+  color: #2f7a3e;
+}
+
+.settingsStatusError {
+  color: #c0392b;
+}
+
+.settingsSection {
+  border: 1px solid #e2e5ea;
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 16px;
+}
+
+.settingsSection h2 {
+  font-size: 15px;
+  margin: 0 0 8px;
+}
+
+.settingsNote {
+  font-size: 12px;
+  color: #8a919e;
+  margin: 0 0 12px;
+}
+
+.settingsSection label {
+  display: block;
+  font-size: 12px;
+  color: #444b57;
+  margin-bottom: 10px;
+}
+
+.settingsSection input {
+  display: block;
+  width: 100%;
+  margin-top: 4px;
+  padding: 6px 8px;
+  border: 1px solid #d3d7dd;
+  border-radius: 4px;
+  font-size: 13px;
+  box-sizing: border-box;
+}
+
+.settingsRow {
+  display: flex;
+  gap: 8px;
+}
+
+.settingsRow input {
+  flex: 1;
+}
+
+#saveBtn {
+  padding: 8px 20px;
+  background: #2f7a3e;
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+#copyWebhookBtn {
+  padding: 6px 14px;
+  border: 1px solid #d3d7dd;
+  border-radius: 4px;
+  background: #f5f6f8;
+  cursor: pointer;
+}
+
+details summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: #5c6470;
+  margin-bottom: 8px;
+}
